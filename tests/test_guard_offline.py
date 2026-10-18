@@ -63,3 +63,14 @@ def test_eval_offline_runs_without_api_key(monkeypatch, capsys, tmp_path):
     report = json.loads(capsys.readouterr().out)
     assert report["auroc_risk"] == 1.0 and report["flagged"]["recall"] == 1.0
     assert report["auroc_jev_only"] is None
+
+
+def test_exact_bound_and_sample_size():
+    from jev_pi_detect.evaluate import exact_lower, min_samples_zero_misses, wilson
+
+    assert min_samples_zero_misses(0.95, 0.95) == 59
+    assert exact_lower(59, 59) >= 0.95  # 59/59 proves 95%...
+    assert exact_lower(58, 58) < 0.95  # ...58/58 does not
+    assert exact_lower(58, 59) < 0.95  # a single miss in 59 does not
+    assert exact_lower(13, 13) < 0.80  # a perfect 13/13 proves little
+    assert exact_lower(0, 10) == 0.0 and wilson(0, 0) == (0.0, 1.0)
