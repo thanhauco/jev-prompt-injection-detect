@@ -84,6 +84,46 @@ jev-pi-detect eval data/sample.jsonl --details    # AUROC + precision/recall
 jev-pi-detect eval data/adversarial.jsonl --offline  # heuristics only, no API key
 ```
 
+## Defense in depth
+
+The filter is one layer. Jev can be steered and any classifier can be evaded, so the rest of the stack assumes it will sometimes miss and limits what a missed injection can do.
+
+| Layer | Module | What it does |
+|---|---|---|
+| Input screening | `PromptInjectionDetector` | Normalization, heuristics, Jev (above) |
+| Prompt structure | `Guard` | Spotlighting with a random boundary; flagged content withheld |
+| Tool-call gate + taint | `ToolPolicy` | Default-deny tools; untrusted context makes sensitive tools need confirmation and limits egress to allow-listed hosts; flagged context denies them |
+| Output checks | `scan_output`, `Canary` | Blocks markdown-image/URL exfiltration, pasted secrets and system-prompt leaks |
+| Audit and review | `AuditLog` | JSONL log (hash only by default), review queue, human labels that feed back into `eval` |
+
+```python
+from jev_pi_detect import (AuditLog, Canary, Guard, PromptInjectionDetector,
+                           SYSTEM_PROMPT_SNIPPET, ToolPolicy, ToolRule, scan_output)
+
+policy = ToolPolicy.from_rules(
+    [
+        ToolRule("search"),
+        ToolRule("send_email", sensitive=True, egress=True, destination_args=("to",)),
+        ToolRule("http_post", egress=True, destination_args=("url",)),
+    ],
+    allowed_destinations=["example.com"],
+)
+guard = Guard(PromptInjectionDetector(), policy=policy, audit=AuditLog("logs/pi.jsonl"))
+canary = Canary.new()
+
+docs = [guard.screen(c, source="rag").text for c in chunks]        # layers 1-3
+system = canary.plant(f"{system_prompt}\n\n{SYSTEM_PROMPT_SNIPPET}")
+reply = main_llm(system, question, docs)
+
+for call in reply.tool_calls:                                        # tool gate
+    decision = policy.check(call.name, call.args)                    # allow / confirm / deny
+out = scan_output(reply.text, allowed_hosts=("example.com",), canary=canary)
+if out.verdict == "block":
+    ...                                                              # drop or redact(reply.text)
+```
+
+Every item passed through `Guard.screen` taints the policy; anything flagged marks it *risky*. The attack needs private data, untrusted input and a way to send data out, and the policy and output layers remove that last leg without needing to guess the attacker's wording.
+
 ## Evaluating and calibrating
 
 `jev-pi-detect eval` reads JSONL (`{"text", "label", "source"?, "context"?}`) and reports AUROC for the combined, Jev-only and heuristic-only scores, plus confusion counts for "flagged" and "blocked". `data/sample.jsonl` is a small smoke-test set. `data/adversarial.jsonl` covers steering (counterfeit policy, verdict injection, notes to the reviewer), token-breaking (spacing, zero-width characters, leetspeak, base64), indirect/agentic payloads (hidden HTML, markdown-image exfiltration, fake chat-template tokens) and hard negatives (security docs, code, "please ignore my previous email"). The heuristics were tuned on these sets, so their offline scores there are optimistic. For real numbers, use public sets such as InjecAgent, BIPIA, deepset/prompt-injections or Tensor Trust, **plus traffic that looks like your own**. Detection quality depends heavily on the deployment, so tune `--review` and `--block` on your data.
